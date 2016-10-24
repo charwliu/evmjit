@@ -1,12 +1,13 @@
-#include "evmjit/JIT.h"
+#include "JIT.h"
 
-#include <array>
 #include <mutex>
 
 #include "preprocessor/llvm_includes_start.h"
 #include <llvm/IR/Module.h>
+#include <llvm/ADT/StringSwitch.h>
 #include <llvm/ADT/Triple.h>
 #include <llvm/ExecutionEngine/MCJIT.h>
+#include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/Host.h>
 #include <llvm/Support/CommandLine.h>
@@ -20,6 +21,19 @@
 #include "Utils.h"
 #include "BuildInfo.gen.h"
 
+
+static_assert(sizeof(evm_uint256be) == 32, "evm_uint256be is too big");
+static_assert(sizeof(evm_uint160be) == 20, "evm_uint160be is too big");
+static_assert(sizeof(evm_result) <= 64, "evm_result does not fit cache line");
+
+// Check enums match int size.
+// On GCC/clang the underlying type should be unsigned int, on MSVC int
+static_assert(sizeof(evm_query_key)  == sizeof(int), "Enum `evm_query_key` is not the size of int");
+static_assert(sizeof(evm_update_key) == sizeof(int), "Enum `evm_update_key` is not the size of int");
+static_assert(sizeof(evm_call_kind)  == sizeof(int), "Enum `evm_call_kind` is not the size of int");
+static_assert(sizeof(evm_mode)       == sizeof(int), "Enum `evm_mode` is not the size of int");
+
+
 namespace dev
 {
 namespace evmjit
@@ -30,18 +44,18 @@ namespace
 {
 using ExecFunc = ReturnCode(*)(ExecutionContext*);
 
-template <size_t _size>
-std::string toHex(std::array<byte, _size> const& _data)
+/// Combine code hash and compatibility mode into a printable code identifier.
+std::string makeCodeId(evm_uint256be codeHash, evm_mode mode)
 {
 	static const auto hexChars = "0123456789abcdef";
 	std::string str;
-	str.resize(_size * 2);
-	auto outIt = str.rbegin(); // reverse for BE
-	for (auto b: _data)
+	str.reserve(sizeof(codeHash) * 2 + 1);
+	for (auto b: codeHash.bytes)
 	{
-		*(outIt++) = hexChars[b & 0xf];
-		*(outIt++) = hexChars[b >> 4];
+		str.push_back(hexChars[b & 0xf]);
+		str.push_back(hexChars[b >> 4]);
 	}
+	str.push_back(mode == EVM_FRONTIER ? 'F' : 'H');
 	return str;
 }
 
@@ -62,8 +76,8 @@ namespace cl = llvm::cl;
 cl::opt<bool> g_optimize{"O", cl::desc{"Optimize"}};
 cl::opt<CacheMode> g_cache{"cache", cl::desc{"Cache compiled EVM code on disk"},
 	cl::values(
-		clEnumValN(CacheMode::on,    "1", "Enabled"),
 		clEnumValN(CacheMode::off,   "0", "Disabled"),
+		clEnumValN(CacheMode::on,    "1", "Enabled"),
 		clEnumValN(CacheMode::read,  "r", "Read only. No new objects are added to cache."),
 		clEnumValN(CacheMode::write, "w", "Write only. No objects are loaded from cache."),
 		clEnumValN(CacheMode::clear, "c", "Clear the cache storage. Cache is disabled."),
@@ -85,6 +99,14 @@ class JITImpl
 	mutable std::mutex x_codeMap;
 	std::unordered_map<std::string, ExecFunc> m_codeMap;
 
+	static llvm::LLVMContext& getLLVMContext()
+	{
+		// TODO: This probably should be thread_local, but for now that causes
+		// a crash when MCJIT is destroyed.
+		static llvm::LLVMContext llvmContext;
+		return llvmContext;
+	}
+
 public:
 	static JITImpl& instance()
 	{
@@ -101,8 +123,68 @@ public:
 	ExecFunc getExecFunc(std::string const& _codeIdentifier) const;
 	void mapExecFunc(std::string const& _codeIdentifier, ExecFunc _funcAddr);
 
-	ExecFunc compile(byte const* _code, uint64_t _codeSize, std::string const& _codeIdentifier, JITSchedule const& _schedule);
+	ExecFunc compile(evm_mode _mode, byte const* _code, uint64_t _codeSize, std::string const& _codeIdentifier);
+
+	evm_query_fn queryFn = nullptr;
+	evm_update_fn updateFn = nullptr;
+	evm_call_fn callFn = nullptr;
 };
+
+
+class SymbolResolver : public llvm::SectionMemoryManager
+{
+	llvm::RuntimeDyld::SymbolInfo findSymbol(std::string const& _name) override
+	{
+		auto& jit = JITImpl::instance();
+		auto addr = llvm::StringSwitch<uint64_t>(_name)
+			.Case("env_sha3", reinterpret_cast<uint64_t>(&keccak))
+			.Case("evm.query", reinterpret_cast<uint64_t>(jit.queryFn))
+			.Case("evm.update", reinterpret_cast<uint64_t>(jit.updateFn))
+			.Case("evm.call", reinterpret_cast<uint64_t>(jit.callFn))
+			.Default(0);
+		if (addr)
+			return {addr, llvm::JITSymbolFlags::Exported};
+
+		// Fallback to default implementation that would search for the symbol
+		// in the current process.
+		// TODO: In the future we should control the whole set of requested
+		//       symbols (like memcpy, memset, etc) to improve performance.
+		return llvm::SectionMemoryManager::findSymbol(_name);
+	}
+
+	void reportMemorySize(size_t _addedSize)
+	{
+		if (!g_stats)
+			return;
+
+		m_totalMemorySize += _addedSize;
+		if (m_totalMemorySize >= m_printMemoryLimit)
+		{
+			static const auto M = 1024 * 1024;
+			auto value = double(m_totalMemorySize) / M;
+			std::cerr << "EVMJIT total memory size: " << value << '\n';
+			m_printMemoryLimit += M;
+		}
+	}
+
+	uint8_t* allocateCodeSection(uintptr_t _size, unsigned _a, unsigned _id,
+	                             llvm::StringRef _name) override
+	{
+		reportMemorySize(_size);
+		return llvm::SectionMemoryManager::allocateCodeSection(_size, _a, _id, _name);
+	}
+
+	uint8_t* allocateDataSection(uintptr_t _size, unsigned _a, unsigned _id,
+	                             llvm::StringRef _name, bool _ro) override
+	{
+		reportMemorySize(_size);
+		return llvm::SectionMemoryManager::allocateDataSection(_size, _a, _id, _name, _ro);
+	}
+
+	size_t m_totalMemorySize = 0;
+	size_t m_printMemoryLimit = 1024 * 1024;
+};
+
 
 JITImpl::JITImpl()
 {
@@ -115,7 +197,7 @@ JITImpl::JITImpl()
 	llvm::InitializeNativeTarget();
 	llvm::InitializeNativeTargetAsmPrinter();
 
-	auto module = llvm::make_unique<llvm::Module>(llvm::StringRef{}, llvm::getGlobalContext());
+	auto module = llvm::make_unique<llvm::Module>("", getLLVMContext());
 
 	// FIXME: LLVM 3.7: test on Windows
 	auto triple = llvm::Triple(llvm::sys::getProcessTriple());
@@ -125,7 +207,11 @@ JITImpl::JITImpl()
 
 	llvm::EngineBuilder builder(std::move(module));
 	builder.setEngineKind(llvm::EngineKind::JIT);
+	builder.setMCJITMemoryManager(llvm::make_unique<SymbolResolver>());
 	builder.setOptLevel(g_optimize ? llvm::CodeGenOpt::Default : llvm::CodeGenOpt::None);
+	#ifndef NDEBUG
+	builder.setVerifyModules(true);
+	#endif
 
 	m_engine.reset(builder.create());
 
@@ -152,15 +238,17 @@ void JITImpl::mapExecFunc(std::string const& _codeIdentifier, ExecFunc _funcAddr
 	m_codeMap.emplace(_codeIdentifier, _funcAddr);
 }
 
-ExecFunc JITImpl::compile(byte const* _code, uint64_t _codeSize, std::string const& _codeIdentifier, JITSchedule const& _schedule)
+ExecFunc JITImpl::compile(evm_mode _mode, byte const* _code, uint64_t _codeSize,
+	std::string const& _codeIdentifier)
 {
-	auto module = Cache::getObject(_codeIdentifier);
+	auto module = Cache::getObject(_codeIdentifier, getLLVMContext());
 	if (!module)
 	{
 		// TODO: Listener support must be redesigned. These should be a feature of JITImpl
 		//listener->stateChanged(ExecState::Compilation);
 		assert(_code || !_codeSize);
-		module = Compiler({}, _schedule).compile(_code, _code + _codeSize, _codeIdentifier);
+		//TODO: Can the Compiler be stateless?
+		module = Compiler({}, _mode, getLLVMContext()).compile(_code, _code + _codeSize, _codeIdentifier);
 
 		if (g_optimize)
 		{
@@ -180,57 +268,11 @@ ExecFunc JITImpl::compile(byte const* _code, uint64_t _codeSize, std::string con
 
 } // anonymous namespace
 
-bool JIT::isCodeReady(std::string const& _codeIdentifier)
-{
-	return JITImpl::instance().getExecFunc(_codeIdentifier) != nullptr;
-}
-
-void JIT::compile(byte const* _code, uint64_t _codeSize, std::string const& _codeIdentifier, JITSchedule const& _schedule)
-{
-	auto& jit = JITImpl::instance();
-	auto execFunc = jit.compile(_code, _codeSize, _codeIdentifier, _schedule);
-	if (execFunc) // FIXME: What with error?
-		jit.mapExecFunc(_codeIdentifier, execFunc);
-}
-
-ReturnCode JIT::exec(ExecutionContext& _context, JITSchedule const& _schedule)
-{
-	//std::unique_ptr<ExecStats> listener{new ExecStats};
-	//listener->stateChanged(ExecState::Started);
-	//static StatsCollector statsCollector;
-
-	auto& jit = JITImpl::instance();
-	auto codeIdentifier = _schedule.codeIdentifier(_context.codeHash());
-	auto execFunc = jit.getExecFunc(codeIdentifier);
-	if (!execFunc)
-	{
-		execFunc = jit.compile(_context.code(), _context.codeSize(), codeIdentifier, _schedule);
-		if (!execFunc)
-			return ReturnCode::LLVMError;
-		jit.mapExecFunc(codeIdentifier, execFunc);
-	}
-
-	//listener->stateChanged(ExecState::Execution);
-	auto returnCode = execFunc(&_context);
-	//listener->stateChanged(ExecState::Return);
-
-	if (returnCode == ReturnCode::Return)
-		_context.returnData = _context.getReturnData(); // Save reference to return data
-
-	//listener->stateChanged(ExecState::Finished);
-	// if (g_stats)
-	// 	statsCollector.stats.push_back(std::move(listener));
-
-	return returnCode;
-}
-
-
-extern "C" void ext_free(void* _data) noexcept;
 
 ExecutionContext::~ExecutionContext() noexcept
 {
 	if (m_memData)
-		ext_free(m_memData); // Use helper free to check memory leaks
+		std::free(m_memData); // Use helper free to check memory leaks
 }
 
 bytes_ref ExecutionContext::getReturnData() const
@@ -248,46 +290,130 @@ bytes_ref ExecutionContext::getReturnData() const
 	return bytes_ref{data, size};
 }
 
-int64_t JITSchedule::id() const
+
+extern "C"
 {
-	int64_t hash = 0;
-	hash = hash * 37 + stepGas0::value;
-	hash = hash * 37 + stepGas1::value;
-	hash = hash * 37 + stepGas2::value;
-	hash = hash * 37 + stepGas3::value;
-	hash = hash * 37 + stepGas4::value;
-	hash = hash * 37 + stepGas5::value;
-	hash = hash * 37 + stepGas6::value;
-	hash = hash * 37 + stepGas7::value;
-	hash = hash * 37 + stackLimit::value;
-	hash = hash * 37 + expByteGas::value;
-	hash = hash * 37 + sha3Gas::value;
-	hash = hash * 37 + sha3WordGas::value;
-	hash = hash * 37 + sloadGas::value;
-	hash = hash * 37 + sstoreSetGas::value;
-	hash = hash * 37 + sstoreResetGas::value;
-	hash = hash * 37 + sstoreClearGas::value;
-	hash = hash * 37 + jumpdestGas::value;
-	hash = hash * 37 + logGas::value;
-	hash = hash * 37 + logDataGas::value;
-	hash = hash * 37 + logTopicGas::value;
-	hash = hash * 37 + createGas::value;
-	hash = hash * 37 + callGas::value;
-	hash = hash * 37 + memoryGas::value;
-	hash = hash * 37 + copyGas::value;
-	hash = hash * 37 + (haveDelegateCall ? 7 : 11);
-	return hash;
+
+static evm_instance* create(evm_query_fn queryFn, evm_update_fn updateFn,
+	evm_call_fn callFn)
+{
+	// Let's always return the same instance. It's a bit of faking, but actually
+	// this might be a compliant implementation.
+	auto& jit = JITImpl::instance();
+	jit.queryFn = queryFn;
+	jit.updateFn = updateFn;
+	jit.callFn = callFn;
+	return reinterpret_cast<evm_instance*>(&jit);
 }
 
-std::string JITSchedule::codeIdentifier(h256 const& _codeHash) const
+static void destroy(evm_instance* instance)
 {
-	int64_t scheduleId = id();
-	return
-		toHex(*(std::array<byte, 32>*)&_codeHash) +
-		"-" +
-		toHex(*(std::array<byte, 8>*)&scheduleId);
+    (void)instance;
+	assert(instance == static_cast<void*>(&JITImpl::instance()));
 }
 
+static void release_result(evm_result const* result)
+{
+	if (result->internal_memory)
+		std::free(result->internal_memory);
+}
 
+static evm_result execute(evm_instance* instance, evm_env* env, evm_mode mode,
+	evm_uint256be code_hash, uint8_t const* code, size_t code_size,
+	int64_t gas, uint8_t const* input, size_t input_size, evm_uint256be value)
+{
+	auto& jit = *reinterpret_cast<JITImpl*>(instance);
+
+	RuntimeData rt;
+	rt.code = code;
+	rt.codeSize = code_size;
+	rt.gas = gas;
+	rt.callData = input;
+	rt.callDataSize = input_size;
+	std::memcpy(&rt.apparentValue, &value, sizeof(value));
+
+	ExecutionContext ctx{rt, env};
+
+	evm_result result;
+	result.code = EVM_SUCCESS;
+	result.gas_left = 0;
+	result.output_data = nullptr;
+	result.output_size = 0;
+	result.internal_memory = nullptr;
+	result.release = release_result;
+
+	auto codeIdentifier = makeCodeId(code_hash, mode);
+	auto execFunc = jit.getExecFunc(codeIdentifier);
+	if (!execFunc)
+	{
+		execFunc = jit.compile(mode, ctx.code(), ctx.codeSize(), codeIdentifier);
+		if (!execFunc)
+			return result;
+		jit.mapExecFunc(codeIdentifier, execFunc);
+	}
+
+	auto returnCode = execFunc(&ctx);
+
+	if (returnCode == ReturnCode::OutOfGas)
+	{
+		// EVMJIT does not provide information what exactly type of failure
+		// it was, so use generic EVM_FAILURE.
+		result.code = EVM_FAILURE;
+	}
+	else
+	{
+		// In case of success return the amount of gas left.
+		result.gas_left = rt.gas;
+	}
+
+	if (returnCode == ReturnCode::Return)
+	{
+		auto out = ctx.getReturnData();
+		result.output_data = std::get<0>(out);
+		result.output_size = std::get<1>(out);
+	}
+
+	// Take care of the internal memory.
+	result.internal_memory = ctx.m_memData;
+	ctx.m_memData = nullptr;
+
+	return result;
+}
+
+static int set_option(evm_instance* instance, char const* name,
+	char const* value)
+{
+	(void)instance, (void)name, (void)value;
+	return 0;
+}
+
+static evm_code_status get_code_status(evm_instance* instance,
+	evm_mode mode, evm_uint256be code_hash)
+{
+	auto& jit = *reinterpret_cast<JITImpl*>(instance);
+	auto codeIdentifier = makeCodeId(code_hash, mode);
+	if (jit.getExecFunc(codeIdentifier) != nullptr)
+		return EVM_READY;
+	// TODO: Add support for EVM_CACHED.
+	return EVM_UNKNOWN;
+}
+
+static void prepare_code(evm_instance* instance, evm_mode mode,
+	evm_uint256be code_hash, unsigned char const* code, size_t code_size)
+{
+	auto& jit = *reinterpret_cast<JITImpl*>(instance);
+	auto codeIdentifier = makeCodeId(code_hash, mode);
+	auto execFunc = jit.compile(mode, code, code_size, codeIdentifier);
+	if (execFunc) // FIXME: What with error?
+		jit.mapExecFunc(codeIdentifier, execFunc);
+}
+
+EXPORT evm_interface evmjit_get_interface()
+{
+	return {EVM_ABI_VERSION, create, destroy, execute,
+			get_code_status, prepare_code, set_option};
+}
+
+}  // extern "C"
 }
 }

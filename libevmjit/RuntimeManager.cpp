@@ -26,16 +26,7 @@ llvm::StructType* RuntimeManager::getRuntimeDataType()
 			Type::Size,		// gasPrice
 			Type::BytePtr,	// callData
 			Type::Size,		// callDataSize
-			Type::Word,		// address
-			Type::Word,		// caller
-			Type::Word,		// origin
-			Type::Word,		// transferredValue
 			Type::Word,		// apparentValue
-			Type::Word,		// coinBase
-			Type::Word,		// difficulty
-			Type::Word,		// gasLimit
-			Type::Size,		// blockNumber
-			Type::Size,		// blockTimestamp
 			Type::BytePtr,	// code
 			Type::Size,		// codeSize
 		};
@@ -71,16 +62,7 @@ llvm::Twine getName(RuntimeData::Index _index)
 	case RuntimeData::GasPrice:		return "tx.gasprice";
 	case RuntimeData::CallData:		return "msg.data.ptr";
 	case RuntimeData::CallDataSize:	return "msg.data.size";
-	case RuntimeData::Address:		return "this.address";
-	case RuntimeData::Caller:		return "msg.caller";
-	case RuntimeData::Origin:		return "tx.origin";
-	case RuntimeData::TransferredCallValue:	return "msg.valuetxed";
 	case RuntimeData::ApparentCallValue:	return "msg.value";
-	case RuntimeData::CoinBase:		return "block.coinbase";
-	case RuntimeData::Difficulty:	return "block.difficulty";
-	case RuntimeData::GasLimit:		return "block.gaslimit";
-	case RuntimeData::Number:		return "block.number";
-	case RuntimeData::Timestamp:	return "block.timestamp";
 	case RuntimeData::Code:			return "code.ptr";
 	case RuntimeData::CodeSize:		return "code.size";
 	}
@@ -92,8 +74,6 @@ RuntimeManager::RuntimeManager(IRBuilder& _builder, code_iterator _codeBegin, co
 	m_codeBegin(_codeBegin),
 	m_codeEnd(_codeEnd)
 {
-	m_longjmp = llvm::Intrinsic::getDeclaration(getModule(), llvm::Intrinsic::eh_sjlj_longjmp);
-
 	// Unpack data
 	auto rtPtr = getRuntimePtr();
 	m_dataPtr = m_builder.CreateLoad(m_builder.CreateStructGEP(getRuntimeType(), rtPtr, 0), "dataPtr");
@@ -168,9 +148,9 @@ llvm::Value* RuntimeManager::getPtr(RuntimeData::Index _index)
 	return ptr;
 }
 
-llvm::Value* RuntimeManager::get(RuntimeData::Index _index)
+llvm::Value* RuntimeManager::getValue()
 {
-	return m_dataElts[_index];
+	return m_dataElts[RuntimeData::ApparentCallValue];
 }
 
 void RuntimeManager::set(RuntimeData::Index _index, llvm::Value* _value)
@@ -191,11 +171,6 @@ void RuntimeManager::registerReturnData(llvm::Value* _offset, llvm::Value* _size
 	set(RuntimeData::ReturnDataSize, size64);
 }
 
-void RuntimeManager::registerSuicide(llvm::Value* _balanceAddress)
-{
-	set(RuntimeData::SuicideDestAddress, _balanceAddress);
-}
-
 void RuntimeManager::exit(ReturnCode _returnCode)
 {
 	m_builder.CreateBr(m_exitBB);
@@ -209,27 +184,9 @@ void RuntimeManager::abort(llvm::Value* _jmpBuf)
 	m_builder.CreateCall(longjmp, {_jmpBuf});
 }
 
-llvm::Value* RuntimeManager::get(Instruction _inst)
-{
-	switch (_inst)
-	{
-	default: assert(false); return nullptr;
-	case Instruction::ADDRESS:		return get(RuntimeData::Address);
-	case Instruction::CALLER:		return get(RuntimeData::Caller);
-	case Instruction::ORIGIN:		return get(RuntimeData::Origin);
-	case Instruction::CALLVALUE:	return get(RuntimeData::ApparentCallValue);
-	case Instruction::GASPRICE:		return get(RuntimeData::GasPrice);
-	case Instruction::COINBASE:		return get(RuntimeData::CoinBase);
-	case Instruction::DIFFICULTY:	return get(RuntimeData::Difficulty);
-	case Instruction::GASLIMIT:		return get(RuntimeData::GasLimit);
-	case Instruction::NUMBER:		return get(RuntimeData::Number);
-	case Instruction::TIMESTAMP:	return get(RuntimeData::Timestamp);
-	}
-}
-
 llvm::Value* RuntimeManager::getCallData()
 {
-	return get(RuntimeData::CallData);
+	return m_dataElts[RuntimeData::CallData];
 }
 
 llvm::Value* RuntimeManager::getCode()
@@ -248,7 +205,7 @@ llvm::Value* RuntimeManager::getCodeSize()
 
 llvm::Value* RuntimeManager::getCallDataSize()
 {
-	auto value = get(RuntimeData::CallDataSize);
+	auto value = m_dataElts[RuntimeData::CallDataSize];
 	assert(value->getType() == Type::Size);
 	return m_builder.CreateZExt(value, Type::Word);
 }

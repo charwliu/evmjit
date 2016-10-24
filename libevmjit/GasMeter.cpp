@@ -4,7 +4,7 @@
 #include <llvm/IR/IntrinsicInst.h>
 #include "preprocessor/llvm_includes_end.h"
 
-#include <evmjit/JIT.h>
+#include "JIT.h"
 #include "Ext.h"
 #include "RuntimeManager.h"
 
@@ -15,10 +15,9 @@ namespace eth
 namespace jit
 {
 
-GasMeter::GasMeter(IRBuilder& _builder, RuntimeManager& _runtimeManager, JITSchedule const& _schedule):
+GasMeter::GasMeter(IRBuilder& _builder, RuntimeManager& _runtimeManager):
 	CompilerHelper(_builder),
-	m_runtimeManager(_runtimeManager),
-	m_schedule(_schedule)
+	m_runtimeManager(_runtimeManager)
 {
 	llvm::Type* gasCheckArgs[] = {Type::Gas->getPointerTo(), Type::Gas, Type::BytePtr};
 	m_gasCheckFunc = llvm::Function::Create(llvm::FunctionType::get(Type::Void, gasCheckArgs, false), llvm::Function::PrivateLinkage, "gas.check", getModule());

@@ -1,18 +1,16 @@
 #include "Compiler.h"
 
-#include <functional>
 #include <fstream>
 #include <chrono>
 #include <sstream>
 
 #include "preprocessor/llvm_includes_start.h"
-#include <llvm/ADT/STLExtras.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include "preprocessor/llvm_includes_end.h"
 
-#include "evmjit/JIT.h"
+#include "JIT.h"
 #include "Instruction.h"
 #include "Type.h"
 #include "Memory.h"
@@ -32,10 +30,10 @@ namespace jit
 
 static const auto c_destIdxLabel = "destIdx";
 
-Compiler::Compiler(Options const& _options, JITSchedule const& _schedule):
+Compiler::Compiler(Options const& _options, evm_mode _mode, llvm::LLVMContext& _llvmContext):
 	m_options(_options),
-	m_schedule(_schedule),
-	m_builder(llvm::getGlobalContext())
+	m_mode(_mode),
+	m_builder(_llvmContext)
 {
 	Type::init(m_builder.getContext());
 }
@@ -176,7 +174,7 @@ std::unique_ptr<llvm::Module> Compiler::compile(code_iterator _begin, code_itera
 
 	// Init runtime structures.
 	RuntimeManager runtimeManager(m_builder, _begin, _end);
-	GasMeter gasMeter(m_builder, runtimeManager, m_schedule);
+	GasMeter gasMeter(m_builder, runtimeManager);
 	Memory memory(runtimeManager, gasMeter);
 	Ext ext(runtimeManager, memory);
 	Arith256 arith(m_builder);
@@ -621,20 +619,42 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 		}
 
 		case Instruction::ADDRESS:
+			stack.push(_ext.query(EVM_ADDRESS));
+			break;
 		case Instruction::CALLER:
+			stack.push(_ext.query(EVM_CALLER));
+			break;
 		case Instruction::ORIGIN:
-		case Instruction::CALLVALUE:
-		case Instruction::GASPRICE:
+			stack.push(_ext.query(EVM_ORIGIN));
+			break;
 		case Instruction::COINBASE:
+			stack.push(_ext.query(EVM_COINBASE));
+			break;
+
+		case Instruction::GASPRICE:
+			stack.push(_ext.query(EVM_GAS_PRICE));
+			break;
+
 		case Instruction::DIFFICULTY:
+			stack.push(_ext.query(EVM_DIFFICULTY));
+			break;
+
 		case Instruction::GASLIMIT:
+			stack.push(_ext.query(EVM_GAS_LIMIT));
+			break;
+
 		case Instruction::NUMBER:
+			stack.push(_ext.query(EVM_NUMBER));
+			break;
+
 		case Instruction::TIMESTAMP:
+			stack.push(_ext.query(EVM_TIMESTAMP));
+			break;
+
+		case Instruction::CALLVALUE:
 		{
-			// Pushes an element of runtime data on stack
-			auto value = _runtimeManager.get(inst);
-			value = m_builder.CreateZExt(value, Type::Word);
-			stack.push(value);
+			auto beValue = _runtimeManager.getValue();
+			stack.push(Endianness::toNative(m_builder, beValue));
 			break;
 		}
 
@@ -649,7 +669,13 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 		case Instruction::BLOCKHASH:
 		{
 			auto number = stack.pop();
+			// If number bigger than int64 assume the result is 0.
+			auto limitC = m_builder.getInt64(std::numeric_limits<int64_t>::max());
+			auto limit = m_builder.CreateZExt(limitC, Type::Word);
+			auto isBigNumber = m_builder.CreateICmpUGT(number, limit);
 			auto hash = _ext.blockHash(number);
+			// TODO: Try to eliminate the call if the number is invalid.
+			hash = m_builder.CreateSelect(isBigNumber, Constant::get(0), hash);
 			stack.push(hash);
 			break;
 		}
@@ -725,34 +751,47 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 			_memory.require(initOff, initSize);
 
 			_gasMeter.commitCostBlock();
-			auto address = _ext.create(endowment, initOff, initSize);
-			stack.push(address);
+			llvm::Value* r = nullptr;
+			llvm::Value* pAddr = nullptr;
+			std::tie(r, pAddr) = _ext.create(endowment, initOff, initSize);
+
+			auto ret =
+				m_builder.CreateICmpSGE(r, m_builder.getInt64(0), "create.ret");
+			auto rmagic = m_builder.CreateSelect(
+				ret, m_builder.getInt64(0), m_builder.getInt64(EVM_CALL_FAILURE),
+				"call.rmagic");
+			// TODO: optimize
+			auto gasLeft = m_builder.CreateSub(r, rmagic, "create.gasleft");
+			_runtimeManager.setGas(gasLeft);
+
+			llvm::Value* addr = m_builder.CreateLoad(pAddr);
+			addr = Endianness::toNative(m_builder, addr);
+			addr = m_builder.CreateZExt(addr, Type::Word);
+			addr = m_builder.CreateSelect(ret, addr, Constant::get(0));
+			stack.push(addr);
 			break;
 		}
 
 		case Instruction::DELEGATECALL:
-			if (!m_schedule.haveDelegateCall)
+			if (m_mode == EVM_FRONTIER)
 			{
-				// invalid opcode
+				// Invalid opcode in Frontier compatibility mode.
 				_runtimeManager.exit(ReturnCode::OutOfGas);
-				it = _basicBlock.end() - 1; // finish block compilation
+				it = _basicBlock.end() - 1;  // finish block compilation
 				break;
 			}
-			// else, fall-through
+		// else, fall-through
 		case Instruction::CALL:
 		case Instruction::CALLCODE:
 		{
+			auto kind = (inst == Instruction::CALL) ?
+							EVM_CALL :
+							(inst == Instruction::CALLCODE) ? EVM_CALLCODE :
+															  EVM_DELEGATECALL;
 			auto callGas = stack.pop();
-			auto codeAddress = stack.pop();
-			llvm::Value* apparentValue = nullptr;
-			llvm::Value* valueTransfer = nullptr;
-			if (inst == Instruction::DELEGATECALL)
-			{
-				apparentValue = _runtimeManager.get(RuntimeData::ApparentCallValue);
-				valueTransfer = Constant::get(0);
-			}
-			else
-				valueTransfer = apparentValue = stack.pop();
+			auto address = stack.pop();
+			auto value = (kind == EVM_DELEGATECALL) ? Constant::get(0) : stack.pop();
+
 			auto inOff = stack.pop();
 			auto inSize = stack.pop();
 			auto outOff = stack.pop();
@@ -761,19 +800,41 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 			_gasMeter.commitCostBlock();
 
 			// Require memory for in and out buffers
-			_memory.require(outOff, outSize);	// Out buffer first as we guess it will be after the in one
+			_memory.require(outOff, outSize);  // Out buffer first as we guess
+											   // it will be after the in one
 			_memory.require(inOff, inSize);
 
-			auto receiveAddress = codeAddress;
-			auto senderAddress = _runtimeManager.get(RuntimeData::Address);
-			if (inst == Instruction::CALLCODE || inst == Instruction::DELEGATECALL)
-				receiveAddress = _runtimeManager.get(RuntimeData::Address);
-			if (inst == Instruction::DELEGATECALL)
-				senderAddress = _runtimeManager.get(RuntimeData::Caller);
+			if (inst == Instruction::CALL)
+			{
+				auto accountExists = _ext.exists(address);
+				auto penalty = m_builder.CreateSelect(accountExists,
+				                                      m_builder.getInt64(0),
+				                                      m_builder.getInt64(JITSchedule::callNewAccount::value));
+				_gasMeter.count(penalty, _runtimeManager.getJmpBuf(),
+				                _runtimeManager.getGasPtr());
+			}
 
-			auto ret = _ext.call(callGas, senderAddress, receiveAddress, codeAddress, valueTransfer, apparentValue, inOff, inSize, outOff, outSize);
-			_gasMeter.count(m_builder.getInt64(0), _runtimeManager.getJmpBuf(), _runtimeManager.getGasPtr());
-			stack.push(ret);
+			auto transfer = m_builder.CreateICmpNE(value, Constant::get(0));
+			auto transferCost = m_builder.CreateSelect(
+				transfer, m_builder.getInt64(JITSchedule::valueTransferGas::value), m_builder.getInt64(0));
+			_gasMeter.count(transferCost, _runtimeManager.getJmpBuf(),
+							_runtimeManager.getGasPtr());
+			_gasMeter.count(callGas, _runtimeManager.getJmpBuf(),
+							_runtimeManager.getGasPtr());
+			auto stipend = m_builder.CreateSelect(transfer, m_builder.getInt64(JITSchedule::callStipend::value), m_builder.getInt64(0));
+			auto gas = m_builder.CreateTrunc(callGas, Type::Gas, "call.gas.declared");
+			gas = m_builder.CreateAdd(gas, stipend, "call.gas", true, true);
+			auto r = _ext.call(kind, gas, address, value, inOff, inSize, outOff,
+							   outSize);
+			auto ret =
+				m_builder.CreateICmpSGE(r, m_builder.getInt64(0), "call.ret");
+			auto rmagic = m_builder.CreateSelect(
+				ret, m_builder.getInt64(0), m_builder.getInt64(EVM_CALL_FAILURE),
+				"call.rmagic");
+			// TODO: optimize
+			auto finalGas = m_builder.CreateSub(r, rmagic, "call.finalgas");
+			_gasMeter.giveBack(finalGas);
+			stack.push(m_builder.CreateZExt(ret, Type::Word));
 			break;
 		}
 
@@ -790,17 +851,11 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 		}
 
 		case Instruction::SUICIDE:
-		{
-			_runtimeManager.registerSuicide(stack.pop());
-			_runtimeManager.exit(ReturnCode::Suicide); // TODO: Suicide is rare. Call Env::suicide directly and stop.
-			break;
-		}
-
+			_ext.selfdestruct(stack.pop());
+			// Fallthrough.
 		case Instruction::STOP:
-		{
 			_runtimeManager.exit(ReturnCode::Stop);
 			break;
-		}
 
 		case Instruction::LOG0:
 		case Instruction::LOG1:
@@ -815,10 +870,10 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 			// This will commit the current cost block
 			_gasMeter.countLogData(numBytes);
 
-			std::array<llvm::Value*, 4> topics{{}};
+			llvm::SmallVector<llvm::Value*, 4> topics;
 			auto numTopics = static_cast<size_t>(inst) - static_cast<size_t>(Instruction::LOG0);
 			for (size_t i = 0; i < numTopics; ++i)
-				topics[i] = stack.pop();
+				topics.emplace_back(stack.pop());
 
 			_ext.log(beginIdx, numBytes, topics);
 			break;
