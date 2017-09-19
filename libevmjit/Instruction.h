@@ -55,6 +55,8 @@ enum class Instruction: uint8_t
 	GASPRICE,			///< get price of gas in current environment
 	EXTCODESIZE,		///< get external code size (from another contract)
 	EXTCODECOPY,		///< copy external code (from another contract)
+	RETURNDATASIZE = 0x3d,
+	RETURNDATACOPY = 0x3e,
 
 	BLOCKHASH = 0x40,	///< get hash of most recent complete block
 	COINBASE,			///< get the block's coinbase address
@@ -154,6 +156,10 @@ enum class Instruction: uint8_t
 	CALLCODE,			///< message-call with another account's code only
 	RETURN,				///< halt execution returning output data
 	DELEGATECALL,		///< like CALLCODE but keeps caller's value and sender (only from homestead on)
+
+	STATICCALL = 0xfa,	///< Like CALL but does not allow state modification.
+
+	REVERT = 0xfd,		///< stop execution and revert state changes, without consuming all provided gas
 	SUICIDE = 0xff		///< halt execution and register account for later deletion
 };
 

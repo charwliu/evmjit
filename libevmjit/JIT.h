@@ -32,15 +32,18 @@ struct RuntimeData
 		GasPrice,
 		CallData,
 		CallDataSize,
-		ApparentCallValue,		// value of msg.value - different during DELEGATECALL
+		Value,  // Value of msg.value - different during DELEGATECALL.
 		Code,
 		CodeSize,
+		Address,
+		Sender,
+		Depth,
 
 		ReturnData 		   = CallData,		///< Return data pointer (set only in case of RETURN)
 		ReturnDataSize 	   = CallDataSize,	///< Return data size (set only in case of RETURN)
 	};
 
-	static size_t const numElements = CodeSize + 1;
+	static size_t const numElements = Depth + 1;
 
 	int64_t 	gas = 0;
 	int64_t 	gasPrice = 0;
@@ -49,6 +52,9 @@ struct RuntimeData
 	i256 		apparentValue;
 	byte const* code = nullptr;
 	uint64_t 	codeSize = 0;
+	byte        address[32];
+	byte        caller[32];
+	int64_t     depth;
 };
 
 struct JITSchedule
@@ -88,6 +94,7 @@ enum class ReturnCode
 	// Success codes
 	Stop    = 0,
 	Return  = 1,
+	Revert  = 2,
 
 	// Standard error codes
 	OutOfGas           = -1,
@@ -102,12 +109,12 @@ class ExecutionContext
 {
 public:
 	ExecutionContext() = default;
-	ExecutionContext(RuntimeData& _data, evm_env* _env) { init(_data, _env); }
+	ExecutionContext(RuntimeData& _data, evm_context* _ctx) { init(_data, _ctx); }
 	ExecutionContext(ExecutionContext const&) = delete;
 	ExecutionContext& operator=(ExecutionContext const&) = delete;
 	~ExecutionContext() noexcept;
 
-	void init(RuntimeData& _data, evm_env* _env) { m_data = &_data; m_env = _env; }
+	void init(RuntimeData& _data, evm_context* _ctx) { m_data = &_data; m_ctx = _ctx; }
 
 	byte const* code() const { return m_data->code; }
 	uint64_t codeSize() const { return m_data->codeSize; }
@@ -116,7 +123,7 @@ public:
 
 public:
 	RuntimeData* m_data = nullptr;	///< Pointer to data. Expected by compiled contract.
-	evm_env* m_env = nullptr;		///< Pointer to environment proxy. Expected by compiled contract.
+	evm_context* m_ctx = nullptr;	///< Pointer to Host execution context. Expected by compiled contract.
 	byte* m_memData = nullptr;
 	uint64_t m_memSize = 0;
 	uint64_t m_memCap = 0;

@@ -1,5 +1,6 @@
 #include "JIT.h"
 
+#include <cstddef>
 #include <mutex>
 
 #include "preprocessor/llvm_includes_start.h"
@@ -9,11 +10,10 @@
 #include <llvm/ExecutionEngine/MCJIT.h>
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/Support/TargetSelect.h>
-#include <llvm/Support/Host.h>
-#include <llvm/Support/CommandLine.h>
-#include <llvm/Support/ManagedStatic.h>
+#include <evm.h>
 #include "preprocessor/llvm_includes_end.h"
 
+#include "Ext.h"
 #include "Compiler.h"
 #include "Optimizer.h"
 #include "Cache.h"
@@ -24,14 +24,14 @@
 
 static_assert(sizeof(evm_uint256be) == 32, "evm_uint256be is too big");
 static_assert(sizeof(evm_uint160be) == 20, "evm_uint160be is too big");
-static_assert(sizeof(evm_result) <= 64, "evm_result does not fit cache line");
+static_assert(sizeof(evm_result) == 64, "evm_result does not fit cache line");
+static_assert(sizeof(evm_message) <= 18*8, "evm_message not optimally packed");
+static_assert(offsetof(evm_message, code_hash) % 8 == 0, "evm_message.code_hash not aligned");
 
 // Check enums match int size.
 // On GCC/clang the underlying type should be unsigned int, on MSVC int
-static_assert(sizeof(evm_query_key)  == sizeof(int), "Enum `evm_query_key` is not the size of int");
-static_assert(sizeof(evm_update_key) == sizeof(int), "Enum `evm_update_key` is not the size of int");
 static_assert(sizeof(evm_call_kind)  == sizeof(int), "Enum `evm_call_kind` is not the size of int");
-static_assert(sizeof(evm_mode)       == sizeof(int), "Enum `evm_mode` is not the size of int");
+static_assert(sizeof(evm_revision)       == sizeof(int), "Enum `evm_revision` is not the size of int");
 
 
 namespace dev
@@ -44,20 +44,22 @@ namespace
 {
 using ExecFunc = ReturnCode(*)(ExecutionContext*);
 
-char modeToChar(evm_mode mode)
+char toChar(evm_revision rev)
 {
-	switch (mode)
+	switch (rev)
 	{
 	case EVM_FRONTIER: return 'F';
 	case EVM_HOMESTEAD: return 'H';
-	case EVM_ANTI_DOS: return 'A';
-	case EVM_CLEARING: return 'C';
+	case EVM_TANGERINE_WHISTLE: return 'T';
+	case EVM_SPURIOUS_DRAGON: return 'S';
+	case EVM_BYZANTIUM: return 'B';
+	case EVM_CONSTANTINOPLE: return 'C';
 	}
 	LLVM_BUILTIN_UNREACHABLE;
 }
 
-/// Combine code hash and compatibility mode into a printable code identifier.
-std::string makeCodeId(evm_uint256be codeHash, evm_mode mode)
+/// Combine code hash and EVM revision into a printable code identifier.
+std::string makeCodeId(evm_uint256be codeHash, evm_revision rev, uint32_t flags)
 {
 	static const auto hexChars = "0123456789abcdef";
 	std::string str;
@@ -67,7 +69,9 @@ std::string makeCodeId(evm_uint256be codeHash, evm_mode mode)
 		str.push_back(hexChars[b & 0xf]);
 		str.push_back(hexChars[b >> 4]);
 	}
-	str.push_back(modeToChar(mode));
+	str.push_back(toChar(rev));
+	if (flags & EVM_STATIC)
+		str.push_back('S');
 	return str;
 }
 
@@ -135,12 +139,67 @@ public:
 	ExecFunc getExecFunc(std::string const& _codeIdentifier) const;
 	void mapExecFunc(std::string const& _codeIdentifier, ExecFunc _funcAddr);
 
-	ExecFunc compile(evm_mode _mode, byte const* _code, uint64_t _codeSize, std::string const& _codeIdentifier);
+	ExecFunc compile(evm_revision _rev, bool _staticCall, byte const* _code, uint64_t _codeSize, std::string const& _codeIdentifier);
 
-	evm_query_fn queryFn = nullptr;
-	evm_update_fn updateFn = nullptr;
-	evm_call_fn callFn = nullptr;
+	evm_host const* host;
+
+	evm_message const* currentMsg = nullptr;
+	std::vector<uint8_t> returnBuffer;
 };
+
+static int64_t call_v2(
+	evm_context* _ctx,
+	evm_call_kind _kind,
+	int64_t _gas,
+	evm_uint160be const* _address,
+	evm_uint256be const* _value,
+	uint8_t const* _inputData,
+	size_t _inputSize,
+	uint8_t* _outputData,
+	size_t _outputSize,
+	uint8_t const** o_bufData,
+	size_t* o_bufSize
+) noexcept
+{
+	auto& jit = JITImpl::instance();
+
+	evm_message msg;
+	msg.kind = _kind;
+	msg.address = *_address;
+	msg.sender = _kind != EVM_DELEGATECALL ? jit.currentMsg->address : jit.currentMsg->sender;
+	msg.value = _kind != EVM_DELEGATECALL ? *_value : jit.currentMsg->value;
+	msg.input = _inputData;
+	msg.input_size = _inputSize;
+	msg.gas = _gas;
+	msg.depth = jit.currentMsg->depth + 1;
+	msg.flags = jit.currentMsg->flags;
+	if (_kind == EVM_STATICCALL)
+	{
+		msg.kind = EVM_CALL;
+		msg.flags |= EVM_STATIC;
+	}
+
+	// FIXME: Handle code hash.
+	evm_result result;
+	jit.host->call(&result, _ctx, &msg);
+	// FIXME: Clarify when gas_left is valid.
+	int64_t r = result.gas_left;
+
+	// Handle output. It can contain data from RETURN or REVERT opcodes.
+	auto size = std::min(_outputSize, result.output_size);
+	std::copy(result.output_data, result.output_data + size, _outputData);
+	jit.returnBuffer = {result.output_data, result.output_data + result.output_size};
+
+	*o_bufData = jit.returnBuffer.data();
+	*o_bufSize = jit.returnBuffer.size();
+
+	if (result.code != EVM_SUCCESS)
+		r |= EVM_CALL_FAILURE;
+
+	if (result.release)
+		result.release(&result);
+	return r;
+}
 
 
 class SymbolResolver : public llvm::SectionMemoryManager
@@ -150,9 +209,16 @@ class SymbolResolver : public llvm::SectionMemoryManager
 		auto& jit = JITImpl::instance();
 		auto addr = llvm::StringSwitch<uint64_t>(_name)
 			.Case("env_sha3", reinterpret_cast<uint64_t>(&keccak))
-			.Case("evm.query", reinterpret_cast<uint64_t>(jit.queryFn))
-			.Case("evm.update", reinterpret_cast<uint64_t>(jit.updateFn))
-			.Case("evm.call", reinterpret_cast<uint64_t>(jit.callFn))
+			.Case("evm.exists", reinterpret_cast<uint64_t>(jit.host->account_exists))
+			.Case("evm.sload", reinterpret_cast<uint64_t>(jit.host->get_storage))
+			.Case("evm.sstore", reinterpret_cast<uint64_t>(jit.host->set_storage))
+			.Case("evm.balance", reinterpret_cast<uint64_t>(jit.host->get_balance))
+			.Case("evm.code", reinterpret_cast<uint64_t>(jit.host->get_code))
+			.Case("evm.selfdestruct", reinterpret_cast<uint64_t>(jit.host->selfdestruct))
+			.Case("evm.call", reinterpret_cast<uint64_t>(call_v2))
+			.Case("evm.get_tx_context", reinterpret_cast<uint64_t>(jit.host->get_tx_context))
+			.Case("evm.blockhash", reinterpret_cast<uint64_t>(jit.host->get_block_hash))
+			.Case("evm.log", reinterpret_cast<uint64_t>(jit.host->log))
 			.Default(0);
 		if (addr)
 			return {addr, llvm::JITSymbolFlags::Exported};
@@ -215,7 +281,7 @@ void JITImpl::mapExecFunc(std::string const& _codeIdentifier, ExecFunc _funcAddr
 	m_codeMap.emplace(_codeIdentifier, _funcAddr);
 }
 
-ExecFunc JITImpl::compile(evm_mode _mode, byte const* _code, uint64_t _codeSize,
+ExecFunc JITImpl::compile(evm_revision _rev, bool _staticCall, byte const* _code, uint64_t _codeSize,
 	std::string const& _codeIdentifier)
 {
 	auto module = Cache::getObject(_codeIdentifier, getLLVMContext());
@@ -225,7 +291,7 @@ ExecFunc JITImpl::compile(evm_mode _mode, byte const* _code, uint64_t _codeSize,
 		//listener->stateChanged(ExecState::Compilation);
 		assert(_code || !_codeSize);
 		//TODO: Can the Compiler be stateless?
-		module = Compiler({}, _mode, getLLVMContext()).compile(_code, _code + _codeSize, _codeIdentifier);
+		module = Compiler({}, _rev, _staticCall, getLLVMContext()).compile(_code, _code + _codeSize, _codeIdentifier);
 
 		if (g_optimize)
 		{
@@ -249,7 +315,7 @@ ExecFunc JITImpl::compile(evm_mode _mode, byte const* _code, uint64_t _codeSize,
 ExecutionContext::~ExecutionContext() noexcept
 {
 	if (m_memData)
-		std::free(m_memData); // Use helper free to check memory leaks
+		std::free(m_memData);
 }
 
 bytes_ref ExecutionContext::getReturnData() const
@@ -271,60 +337,58 @@ bytes_ref ExecutionContext::getReturnData() const
 extern "C"
 {
 
-static evm_instance* create(evm_query_fn queryFn, evm_update_fn updateFn,
-	evm_call_fn callFn)
+static evm_instance* create(const evm_host* _host)
 {
 	// Let's always return the same instance. It's a bit of faking, but actually
 	// this might be a compliant implementation.
 	auto& jit = JITImpl::instance();
-	jit.queryFn = queryFn;
-	jit.updateFn = updateFn;
-	jit.callFn = callFn;
+	jit.host = _host;
 	return &jit;
 }
 
 static void destroy(evm_instance* instance)
 {
-    (void)instance;
+	(void)instance;
 	assert(instance == static_cast<void*>(&JITImpl::instance()));
 }
 
-static void release_result(evm_result const* result)
-{
-	if (result->internal_memory)
-		std::free(result->internal_memory);
-}
-
-static evm_result execute(evm_instance* instance, evm_env* env, evm_mode mode,
-	evm_uint256be code_hash, uint8_t const* code, size_t code_size,
-	int64_t gas, uint8_t const* input, size_t input_size, evm_uint256be value)
+static evm_result execute(evm_instance* instance, evm_context* context, evm_revision rev,
+	evm_message const* msg, uint8_t const* code, size_t code_size)
 {
 	auto& jit = *reinterpret_cast<JITImpl*>(instance);
+
+	// TODO: Temporary keep track of the current message.
+	evm_message const* prevMsg = jit.currentMsg;
+	jit.currentMsg = msg;
 
 	RuntimeData rt;
 	rt.code = code;
 	rt.codeSize = code_size;
-	rt.gas = gas;
-	rt.callData = input;
-	rt.callDataSize = input_size;
-	std::memcpy(&rt.apparentValue, &value, sizeof(value));
+	rt.gas = msg->gas;
+	rt.callData = msg->input;
+	rt.callDataSize = msg->input_size;
+	std::memcpy(&rt.apparentValue, &msg->value, sizeof(msg->value));
+	std::memset(&rt.address, 0, 12);
+	std::memcpy(&rt.address[12], &msg->address, sizeof(msg->address));
+	std::memset(&rt.caller, 0, 12);
+	std::memcpy(&rt.caller[12], &msg->sender, sizeof(msg->sender));
+	rt.depth = msg->depth;
 
-	ExecutionContext ctx{rt, env};
+	ExecutionContext ctx{rt, context};
 
 	evm_result result;
 	result.code = EVM_SUCCESS;
 	result.gas_left = 0;
 	result.output_data = nullptr;
 	result.output_size = 0;
-	result.error_message = nullptr;
-	result.internal_memory = nullptr;
-	result.release = release_result;
+	result.release = nullptr;
 
-	auto codeIdentifier = makeCodeId(code_hash, mode);
+	auto codeIdentifier = makeCodeId(msg->code_hash, rev, msg->flags);
 	auto execFunc = jit.getExecFunc(codeIdentifier);
 	if (!execFunc)
 	{
-		execFunc = jit.compile(mode, ctx.code(), ctx.codeSize(), codeIdentifier);
+		bool const staticCall = (msg->flags & EVM_STATIC) != 0;
+		execFunc = jit.compile(rev, staticCall, ctx.code(), ctx.codeSize(), codeIdentifier);
 		if (!execFunc)
 			return result;
 		jit.mapExecFunc(codeIdentifier, execFunc);
@@ -332,7 +396,12 @@ static evm_result execute(evm_instance* instance, evm_env* env, evm_mode mode,
 
 	auto returnCode = execFunc(&ctx);
 
-	if (returnCode == ReturnCode::OutOfGas)
+	if (returnCode == ReturnCode::Revert)
+	{
+		result.code = EVM_REVERT;
+		result.gas_left = rt.gas;
+	}
+	else if (returnCode == ReturnCode::OutOfGas)
 	{
 		// EVMJIT does not provide information what exactly type of failure
 		// it was, so use generic EVM_FAILURE.
@@ -344,7 +413,7 @@ static evm_result execute(evm_instance* instance, evm_env* env, evm_mode mode,
 		result.gas_left = rt.gas;
 	}
 
-	if (returnCode == ReturnCode::Return)
+	if (returnCode == ReturnCode::Return || returnCode == ReturnCode::Revert)
 	{
 		auto out = ctx.getReturnData();
 		result.output_data = std::get<0>(out);
@@ -352,9 +421,20 @@ static evm_result execute(evm_instance* instance, evm_env* env, evm_mode mode,
 	}
 
 	// Take care of the internal memory.
-	result.internal_memory = ctx.m_memData;
-	ctx.m_memData = nullptr;
+	if (ctx.m_memData)
+	{
+		// Use result's reserved data to store the memory pointer.
+		result.reserved.context = ctx.m_memData;
 
+		// Set pointer to the destructor that will release the memory.
+		result.release = [](evm_result const* result)
+		{
+			std::free(result->reserved.context);
+		};
+		ctx.m_memData = nullptr;
+	}
+
+	jit.currentMsg = prevMsg;
 	return result;
 }
 
@@ -366,22 +446,23 @@ static int set_option(evm_instance* instance, char const* name,
 }
 
 static evm_code_status get_code_status(evm_instance* instance,
-	evm_mode mode, evm_uint256be code_hash)
+	evm_revision rev, uint32_t flags, evm_uint256be code_hash)
 {
 	auto& jit = *reinterpret_cast<JITImpl*>(instance);
-	auto codeIdentifier = makeCodeId(code_hash, mode);
+	auto codeIdentifier = makeCodeId(code_hash, rev, flags);
 	if (jit.getExecFunc(codeIdentifier) != nullptr)
 		return EVM_READY;
 	// TODO: Add support for EVM_CACHED.
 	return EVM_UNKNOWN;
 }
 
-static void prepare_code(evm_instance* instance, evm_mode mode,
+static void prepare_code(evm_instance* instance, evm_revision rev, uint32_t flags,
 	evm_uint256be code_hash, unsigned char const* code, size_t code_size)
 {
 	auto& jit = *reinterpret_cast<JITImpl*>(instance);
-	auto codeIdentifier = makeCodeId(code_hash, mode);
-	auto execFunc = jit.compile(mode, code, code_size, codeIdentifier);
+	auto codeIdentifier = makeCodeId(code_hash, rev, flags);
+	bool const staticCall = (flags & EVM_STATIC) != 0;
+	auto execFunc = jit.compile(rev, staticCall, code, code_size, codeIdentifier);
 	if (execFunc) // FIXME: What with error?
 		jit.mapExecFunc(codeIdentifier, execFunc);
 }

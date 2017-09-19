@@ -11,7 +11,14 @@ namespace eth
 {
 namespace jit
 {
-	class Memory;
+
+/// The flag indicating call failure in evm_call_fn() -- highest bit set.
+constexpr int64_t EVM_CALL_FAILURE = 0x8000000000000000;
+
+/// The hackish constant indicating EVM_CALL + EVM_STATIC flag.
+constexpr int EVM_STATICCALL = EVM_CREATE + 1;
+
+class Memory;
 
 struct MemoryRef
 {
@@ -48,7 +55,6 @@ public:
 	llvm::Value* sload(llvm::Value* _index);
 	void sstore(llvm::Value* _index, llvm::Value* _value);
 
-	llvm::Value* query(evm_query_key _key);
 	llvm::Value* balance(llvm::Value* _address);
 	llvm::Value* exists(llvm::Value* _address);
 	llvm::Value* calldataload(llvm::Value* _index);
@@ -62,7 +68,7 @@ public:
 	void log(llvm::Value* _memIdx, llvm::Value* _numBytes, llvm::ArrayRef<llvm::Value*> _topics);
 	void selfdestruct(llvm::Value* _beneficiary);
 
-	llvm::Value* call(evm_call_kind _kind,
+	llvm::Value* call(int _kind,
 	                  llvm::Value* _gas,
 	                  llvm::Value* _addr,
 	                  llvm::Value* _value,
@@ -86,7 +92,6 @@ private:
 
 	llvm::CallInst* createCall(EnvFunc _funcId, std::initializer_list<llvm::Value*> const& _args);
 	llvm::Value* getArgAlloca();
-	llvm::Value* byPtr(llvm::Value* _value);
 
 	llvm::Value* createCABICall(llvm::Function* _func,
 	                            std::initializer_list<llvm::Value*> const& _args);

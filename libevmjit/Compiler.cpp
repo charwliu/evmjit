@@ -30,9 +30,10 @@ namespace jit
 
 static const auto c_destIdxLabel = "destIdx";
 
-Compiler::Compiler(Options const& _options, evm_mode _mode, llvm::LLVMContext& _llvmContext):
+Compiler::Compiler(Options const& _options, evm_revision _rev, bool _staticCall, llvm::LLVMContext& _llvmContext):
 	m_options(_options),
-	m_mode(_mode),
+	m_rev(_rev),
+	m_staticCall(_staticCall),
 	m_builder(_llvmContext)
 {
 	Type::init(m_builder.getContext());
@@ -75,6 +76,7 @@ std::vector<BasicBlock> Compiler::createBasicBlocks(code_iterator _codeBegin, co
 		{
 		case Instruction::JUMP:
 		case Instruction::RETURN:
+		case Instruction::REVERT:
 		case Instruction::STOP:
 		case Instruction::SUICIDE:
 			isDead = true;
@@ -174,7 +176,7 @@ std::unique_ptr<llvm::Module> Compiler::compile(code_iterator _begin, code_itera
 
 	// Init runtime structures.
 	RuntimeManager runtimeManager(m_builder, _begin, _end);
-	GasMeter gasMeter(m_builder, runtimeManager, m_mode);
+	GasMeter gasMeter(m_builder, runtimeManager, m_rev);
 	Memory memory(runtimeManager, gasMeter);
 	Ext ext(runtimeManager, memory);
 	Arith256 arith(m_builder);
@@ -572,6 +574,9 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 
 		case Instruction::SSTORE:
 		{
+			if (m_staticCall)
+				goto invalidInstruction;
+
 			auto index = stack.pop();
 			auto value = stack.pop();
 			_gasMeter.countSStore(_ext, index, value);
@@ -619,36 +624,36 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 		}
 
 		case Instruction::ADDRESS:
-			stack.push(_ext.query(EVM_ADDRESS));
+			stack.push(Endianness::toNative(m_builder, _runtimeManager.getAddress()));
 			break;
 		case Instruction::CALLER:
-			stack.push(_ext.query(EVM_CALLER));
+			stack.push(Endianness::toNative(m_builder, _runtimeManager.getSender()));
 			break;
 		case Instruction::ORIGIN:
-			stack.push(_ext.query(EVM_ORIGIN));
+			stack.push(m_builder.CreateZExt(Endianness::toNative(m_builder, _runtimeManager.getTxContextItem(1)), Type::Word));
 			break;
 		case Instruction::COINBASE:
-			stack.push(_ext.query(EVM_COINBASE));
+			stack.push(m_builder.CreateZExt(Endianness::toNative(m_builder, _runtimeManager.getTxContextItem(2)), Type::Word));
 			break;
 
 		case Instruction::GASPRICE:
-			stack.push(_ext.query(EVM_GAS_PRICE));
+			stack.push(Endianness::toNative(m_builder, _runtimeManager.getTxContextItem(0)));
 			break;
 
 		case Instruction::DIFFICULTY:
-			stack.push(_ext.query(EVM_DIFFICULTY));
+			stack.push(Endianness::toNative(m_builder, _runtimeManager.getTxContextItem(6)));
 			break;
 
 		case Instruction::GASLIMIT:
-			stack.push(_ext.query(EVM_GAS_LIMIT));
+			stack.push(m_builder.CreateZExt(_runtimeManager.getTxContextItem(5), Type::Word));
 			break;
 
 		case Instruction::NUMBER:
-			stack.push(_ext.query(EVM_NUMBER));
+			stack.push(m_builder.CreateZExt(_runtimeManager.getTxContextItem(3), Type::Word));
 			break;
 
 		case Instruction::TIMESTAMP:
-			stack.push(_ext.query(EVM_TIMESTAMP));
+			stack.push(m_builder.CreateZExt(_runtimeManager.getTxContextItem(4), Type::Word));
 			break;
 
 		case Instruction::CALLVALUE:
@@ -665,6 +670,17 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 		case Instruction::CALLDATASIZE:
 			stack.push(_runtimeManager.getCallDataSize());
 			break;
+
+		case Instruction::RETURNDATASIZE:
+		{
+			if (m_rev < EVM_BYZANTIUM)
+				goto invalidInstruction;
+
+			auto returnBufSizePtr = _runtimeManager.getReturnBufSizePtr();
+			auto returnBufSize = m_builder.CreateLoad(returnBufSizePtr);
+			stack.push(m_builder.CreateZExt(returnBufSize, Type::Word));
+			break;
+		}
 
 		case Instruction::BLOCKHASH:
 		{
@@ -709,6 +725,22 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 			break;
 		}
 
+		case Instruction::RETURNDATACOPY:
+		{
+			if (m_rev < EVM_BYZANTIUM)
+				goto invalidInstruction;
+
+			auto destMemIdx = stack.pop();
+			auto srcIdx = stack.pop();
+			auto reqBytes = stack.pop();
+
+			auto srcPtr = m_builder.CreateLoad(_runtimeManager.getReturnBufDataPtr());
+			auto srcSize = m_builder.CreateLoad(_runtimeManager.getReturnBufSizePtr());
+
+			_memory.copyBytesNoPadding(srcPtr, srcSize, srcIdx, destMemIdx, reqBytes);
+			break;
+		}
+
 		case Instruction::CODECOPY:
 		{
 			auto destMemIdx = stack.pop();
@@ -745,6 +777,9 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 
 		case Instruction::CREATE:
 		{
+			if (m_staticCall)
+				goto invalidInstruction;
+
 			auto endowment = stack.pop();
 			auto initOff = stack.pop();
 			auto initSize = stack.pop();
@@ -752,7 +787,7 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 
 			_gasMeter.commitCostBlock();
 			auto gas = _runtimeManager.getGas();
-			llvm::Value* gasKept = (m_mode >= EVM_ANTI_DOS) ?
+			llvm::Value* gasKept = (m_rev >= EVM_TANGERINE_WHISTLE) ?
 			                       m_builder.CreateLShr(gas, 6) :
 			                       m_builder.getInt64(0);
 			auto createGas = m_builder.CreateSub(gas, gasKept, "create.gas", true, true);
@@ -778,25 +813,22 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 			break;
 		}
 
-		case Instruction::DELEGATECALL:
-			if (m_mode == EVM_FRONTIER)
-			{
-				// Invalid opcode in Frontier compatibility mode.
-				_runtimeManager.exit(ReturnCode::OutOfGas);
-				it = _basicBlock.end() - 1;  // finish block compilation
-				break;
-			}
-		// else, fall-through
 		case Instruction::CALL:
 		case Instruction::CALLCODE:
+		case Instruction::DELEGATECALL:
+		case Instruction::STATICCALL:
 		{
-			auto kind = (inst == Instruction::CALL) ?
-							EVM_CALL :
-							(inst == Instruction::CALLCODE) ? EVM_CALLCODE :
-															  EVM_DELEGATECALL;
+			// Handle invalid instructions.
+			if (inst == Instruction::DELEGATECALL && m_rev < EVM_HOMESTEAD)
+				goto invalidInstruction;
+
+			if (inst == Instruction::STATICCALL && m_rev < EVM_BYZANTIUM)
+				goto invalidInstruction;
+
 			auto callGas = stack.pop();
 			auto address = stack.pop();
-			auto value = (kind == EVM_DELEGATECALL) ? Constant::get(0) : stack.pop();
+			bool hasValue = inst == Instruction::CALL || inst == Instruction::CALLCODE;
+			auto value = hasValue ? stack.pop() : Constant::get(0);
 
 			auto inOff = stack.pop();
 			auto inSize = stack.pop();
@@ -811,9 +843,16 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 			_memory.require(inOff, inSize);
 
 			auto noTransfer = m_builder.CreateICmpEQ(value, Constant::get(0));
+
+			// For static call mode, select infinite penalty for CALL with
+			// value transfer.
+			auto const transferGas = (inst == Instruction::CALL && m_staticCall) ?
+				std::numeric_limits<int64_t>::max() :
+				JITSchedule::valueTransferGas::value;
+
 			auto transferCost = m_builder.CreateSelect(
 					noTransfer, m_builder.getInt64(0),
-					m_builder.getInt64(JITSchedule::valueTransferGas::value));
+					m_builder.getInt64(transferGas));
 			_gasMeter.count(transferCost, _runtimeManager.getJmpBuf(),
 							_runtimeManager.getGasPtr());
 
@@ -821,7 +860,7 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 			{
 				auto accountExists = _ext.exists(address);
 				auto noPenaltyCond = accountExists;
-				if (m_mode >= EVM_CLEARING)
+				if (m_rev >= EVM_SPURIOUS_DRAGON)
 					noPenaltyCond = m_builder.CreateOr(accountExists, noTransfer);
 				auto penalty = m_builder.CreateSelect(noPenaltyCond,
 				                                      m_builder.getInt64(0),
@@ -830,7 +869,7 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 				                _runtimeManager.getGasPtr());
 			}
 
-			if (m_mode >= EVM_ANTI_DOS)
+			if (m_rev >= EVM_TANGERINE_WHISTLE)
 			{
 				auto gas = _runtimeManager.getGas();
 				auto gas64th = m_builder.CreateLShr(gas, 6);
@@ -848,6 +887,17 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 					m_builder.getInt64(JITSchedule::callStipend::value));
 			auto gas = m_builder.CreateTrunc(callGas, Type::Gas, "call.gas.declared");
 			gas = m_builder.CreateAdd(gas, stipend, "call.gas", true, true);
+			int kind = [inst]() -> int
+			{
+				switch (inst)
+				{
+				case Instruction::CALL: return EVM_CALL;
+				case Instruction::CALLCODE: return EVM_CALLCODE;
+				case Instruction::DELEGATECALL: return EVM_DELEGATECALL;
+				case Instruction::STATICCALL: return EVM_STATICCALL;
+				default: LLVM_BUILTIN_UNREACHABLE;
+				}
+			}();
 			auto r = _ext.call(kind, gas, address, value, inOff, inSize, outOff,
 							   outSize);
 			auto ret =
@@ -863,27 +913,35 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 		}
 
 		case Instruction::RETURN:
+		case Instruction::REVERT:
 		{
+			auto const isRevert = inst == Instruction::REVERT;
+			if (isRevert && m_rev < EVM_BYZANTIUM)
+				goto invalidInstruction;
+
 			auto index = stack.pop();
 			auto size = stack.pop();
 
 			_memory.require(index, size);
 			_runtimeManager.registerReturnData(index, size);
 
-			_runtimeManager.exit(ReturnCode::Return);
+			_runtimeManager.exit(isRevert ? ReturnCode::Revert : ReturnCode::Return);
 			break;
 		}
 
 		case Instruction::SUICIDE:
 		{
+			if (m_staticCall)
+				goto invalidInstruction;
+
 			auto dest = stack.pop();
-			if (m_mode >= EVM_ANTI_DOS)
+			if (m_rev >= EVM_TANGERINE_WHISTLE)
 			{
 				auto destExists = _ext.exists(dest);
 				auto noPenaltyCond = destExists;
-				if (m_mode >= EVM_CLEARING)
+				if (m_rev >= EVM_SPURIOUS_DRAGON)
 				{
-					auto addr = _ext.query(EVM_ADDRESS);
+					auto addr = Endianness::toNative(m_builder, _runtimeManager.getAddress());
 					auto balance = _ext.balance(addr);
 					auto noTransfer = m_builder.CreateICmpEQ(balance,
 					                                         Constant::get(0));
@@ -908,6 +966,9 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 		case Instruction::LOG3:
 		case Instruction::LOG4:
 		{
+			if (m_staticCall)
+				goto invalidInstruction;
+
 			auto beginIdx = stack.pop();
 			auto numBytes = stack.pop();
 			_memory.require(beginIdx, numBytes);
@@ -924,6 +985,7 @@ void Compiler::compileBasicBlock(BasicBlock& _basicBlock, RuntimeManager& _runti
 			break;
 		}
 
+		invalidInstruction:
 		default: // Invalid instruction - abort
 			_runtimeManager.exit(ReturnCode::OutOfGas);
 			it = _basicBlock.end() - 1; // finish block compilation
